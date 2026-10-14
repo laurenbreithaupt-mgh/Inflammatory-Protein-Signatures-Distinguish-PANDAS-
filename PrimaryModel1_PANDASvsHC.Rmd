@@ -1,0 +1,2246 @@
+```{r}
+#------------------------------------------------------------------------
+# Contact Luke Dysart (ldysart@mgh.harvard.edu) or Lauren Breithaupt (lbreithaupt@mgh.harvard.edu) for any bug report.
+# Last update: 10.11.2026
+#------------------------------------------------------------------------
+
+library(tidyverse)
+library(conflicted)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(pROC)
+library(randomForest)
+library(pheatmap)
+library(uwot)
+library(MASS)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+library(e1071)
+library(xgboost)
+library(inflection)
+
+#load("PrimaryModelOne.RData")
+#load("NPX_raw.RData")
+
+conflicts_prefer(caret::confusionMatrix)
+conflicts_prefer(pROC::auc)
+conflicts_prefer(pROC::roc)
+conflicts_prefer(dplyr::slice) 
+conflicts_prefer(dplyr::filter)    
+conflicts_prefer(dplyr::select)   
+conflicts_prefer(dplyr::mutate)   
+conflicts_prefer(dplyr::desc)   
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(dplyr::arrange)
+conflicts_prefer(base::as.matrix)
+conflicts_prefer(rpart::prune)
+conflicts_prefer(base::as.factor)
+conflicted::conflicts_prefer(base::setdiff)
+
+set.seed(2025)
+
+PrimaryModelOne <- PrimaryModelOne %>% filter(`Protocol enrolled in` != "11-M-0058")
+# One row per participant, BL visit kept if they have one
+PrimaryModelOne <- PrimaryModelOne %>%
+  arrange(`Unique Sample ID`, desc(Visit == "BL")) %>%
+  distinct(`Unique Sample ID`, .keep_all = TRUE)
+```
+
+# Primary Model #1
+
+Each model is evaluated at two probability cutoffs. The default is 0.5, so anyone with more than a 50% predicted probability of PANDAS is called PANDAS. The 0.85 cutoff is the stricter one for confirmation, where only people with more than an 85% probability get called PANDAS and everyone else is called HC. It trades sensitivity for fewer false positives.
+
+Confusion matrices are laid out like this:
+
+```
+            Actual
+Predicted   PANDAS   HC
+PANDAS      AA       BB     <- Above the cutoff (>50% or >85% probability of PANDAS)
+HC          CC       DD     <- Everyone else
+```
+
+# 1. Classification Tree -- No Covariates
+
+Cross-Fold Validation
+
+```{r}
+#------------------------------------------------------------------------
+# 1. Classification Tree -- No Covariates
+#------------------------------------------------------------------------
+set.seed(2025)
+protein_columns <- setdiff(colnames(PrimaryModelOne)[which(colnames(PrimaryModelOne) == "X4E.BP1"):which(colnames(PrimaryModelOne) == "VEGFA")], c("CCL23", "CXCL5"))
+
+tree_data <- PrimaryModelOne[, c("Diagnosis", protein_columns)]
+tree_data$Diagnosis <- factor(tree_data$Diagnosis, levels = c("PANDAS", "HC"))
+
+class_counts <- table(tree_data$Diagnosis)
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+sample_weights <- class_weights[tree_data$Diagnosis]
+
+td <- tree_data
+colnames(td) <- make.names(colnames(td), unique = TRUE)
+
+cat("========== DECISION TREE: PANDAS vs HC ==========\n\n")
+
+cat("--- Tuning cp via One Standard Error Rule ---\n\n")
+
+# This is the line that sets up cross fold validation
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 50,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "all")
+
+cp_grid <- expand.grid(cp = seq(0, 0.10, by = 0.005))
+
+# Tree is run here ctrl used for cross fold validation
+tree_cv <- caret::train(Diagnosis ~ .,
+                 data = td,
+                 method = "rpart",
+                 trControl = ctrl,
+                 metric = "ROC",
+                 tuneGrid = cp_grid,
+                 weights = sample_weights)
+
+results <- tree_cv$results
+best_roc <- max(results$ROC)
+best_row <- which.max(results$ROC)
+se_at_best <- results$ROCSD[best_row] / sqrt(50)
+threshold_1se <- best_roc - se_at_best
+
+eligible <- results[results$ROC >= threshold_1se, ]
+selected_cp <- max(eligible$cp)
+
+cat("Best ROC:", round(best_roc, 4), "\n")
+cat("Threshold (best - 1 SE):", round(threshold_1se, 4), "\n")
+cat("Selected cp (simplest within 1 SE):", selected_cp, "\n")
+cat("ROC at selected cp:", round(results$ROC[results$cp == selected_cp], 4), "\n\n")
+
+cat("--- Final Tree (cp =", selected_cp, ") ---\n\n")
+
+tree_model <- rpart(Diagnosis ~ ., data = tree_data, method = "class",
+                    control = rpart.control(cp = selected_cp),
+                    weights = sample_weights)
+
+rpart.plot(tree_model, type = 3, extra = 1, under = TRUE, cex = 0.6,
+           main = paste("Decision Tree (cp =", selected_cp, ")"))
+
+cat("Variables used in tree:\n")
+print(tree_model$variable.importance)
+
+cat("\n--- Training Set Performance ---\n\n")
+
+predictions <- predict(tree_model, tree_data, type = "class")
+conf_matrix <- confusionMatrix(predictions, tree_data$Diagnosis, positive = "PANDAS")
+print(conf_matrix)
+
+cat("\n--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+oof <- tree_cv$pred
+oof_best <- oof[oof$cp == selected_cp, ]
+
+roc_cv <- roc(response = oof_best$obs, predictor = oof_best$PANDAS, levels = c("HC", "PANDAS"))
+roc_fig_tree <- roc_cv
+plot(roc_cv, main = paste("Repeated CV ROC: PANDAS vs HC (cp =", selected_cp, ")"))
+auc_cv <- auc(roc_cv)
+auc_sd <- results$ROCSD[results$cp == selected_cp]
+
+pred_05_cv <- ifelse(oof_best$PANDAS >= 0.5, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof_best$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(oof_best$obs, levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Balanced threshold for general classification\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The weighted decision tree achieved an AUC of", round(as.numeric(auc_cv), 3), "±", round(auc_sd, 3), 
+    "in 10-fold cross-validation (50 repeats).\n")
+cat("At a 0.5 threshold optimized for screening, the model achieved", round(sens_05 * 100, 1), 
+    "% sensitivity and", round(spec_05 * 100, 1), "% specificity for detecting PANDAS cases.\n")
+cat("At a 0.85 threshold optimized for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+cat("Final model uses cp =", selected_cp, "(selected via one standard error rule).\n")
+```
+
+# 2. Classification Tree -- With Covariates
+
+```{r}
+#------------------------------------------------------------------------
+# 2. Classification Tree -- With Covariates
+#------------------------------------------------------------------------
+PrimaryModelOne <- PrimaryModelOne %>% mutate(Race = as.factor(Race), Ethnicity = as.factor(Ethnicity), Sex = as.factor(Sex))
+
+protein_columns <- setdiff(colnames(PrimaryModelOne)[which(colnames(PrimaryModelOne) == "X4E.BP1"):which(colnames(PrimaryModelOne) == "VEGFA")], c("CCL23", "CXCL5"))
+
+
+tree_data <- PrimaryModelOne[, c("Diagnosis", "Race", "Ethnicity", "Sex", protein_columns)]
+tree_data <- tree_data[complete.cases(tree_data), ]
+tree_data$Diagnosis <- factor(tree_data$Diagnosis, levels = c("PANDAS", "HC"))
+
+class_counts <- table(tree_data$Diagnosis)
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+sample_weights <- class_weights[tree_data$Diagnosis]
+
+td <- tree_data
+colnames(td) <- make.names(colnames(td), unique = TRUE)
+
+cat("========== DECISION TREE WITH DEMOGRAPHICS: PANDAS vs HC ==========\n\n")
+
+cat("--- Tuning cp via One Standard Error Rule ---\n\n")
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 50,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "all")
+
+cp_grid <- expand.grid(cp = seq(0, 0.10, by = 0.005))
+
+tree_cv <- caret::train(Diagnosis ~ .,
+                 data = td,
+                 method = "rpart",
+                 trControl = ctrl,
+                 metric = "ROC",
+                 tuneGrid = cp_grid,
+                 weights = sample_weights)
+
+results <- tree_cv$results
+best_roc <- max(results$ROC)
+best_row <- which.max(results$ROC)
+se_at_best <- results$ROCSD[best_row] / sqrt(50)
+threshold_1se <- best_roc - se_at_best
+
+eligible <- results[results$ROC >= threshold_1se, ]
+selected_cp <- max(eligible$cp)
+
+cat("Best ROC:", round(best_roc, 4), "\n")
+cat("Threshold (best - 1 SE):", round(threshold_1se, 4), "\n")
+cat("Selected cp (simplest within 1 SE):", selected_cp, "\n")
+cat("ROC at selected cp:", round(results$ROC[results$cp == selected_cp], 4), "\n\n")
+
+cat("--- Final Tree (cp =", selected_cp, ") ---\n\n")
+
+tree_model <- rpart(Diagnosis ~ ., data = tree_data, method = "class",
+                    control = rpart.control(cp = selected_cp),
+                    weights = sample_weights)
+
+rpart.plot(tree_model, type = 3, extra = 1, under = TRUE, cex = 0.6,
+           main = paste("Decision Tree with Demographics (cp =", selected_cp, ")"))
+
+cat("Variables used in tree:\n")
+print(tree_model$variable.importance)
+
+cat("\n--- Training Set Performance ---\n\n")
+
+predictions <- predict(tree_model, tree_data, type = "class")
+conf_matrix <- confusionMatrix(predictions, tree_data$Diagnosis, positive = "PANDAS")
+print(conf_matrix)
+
+cat("\n--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+oof <- tree_cv$pred
+oof_best <- oof[oof$cp == selected_cp, ]
+
+roc_cv <- roc(response = oof_best$obs, predictor = oof_best$PANDAS, levels = c("HC", "PANDAS"))
+roc_fig_tree_cov <- roc_cv
+plot(roc_cv, main = paste("Repeated CV ROC: PANDAS vs HC with Demographics (cp =", selected_cp, ")"))
+auc_cv <- auc(roc_cv)
+auc_sd <- results$ROCSD[results$cp == selected_cp]
+
+pred_05_cv <- ifelse(oof_best$PANDAS >= 0.5, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof_best$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(oof_best$obs, levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Balanced threshold for general classification\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The weighted decision tree with demographics achieved an AUC of", round(as.numeric(auc_cv), 3), "±", round(auc_sd, 3), 
+    "in 10-fold cross-validation (50 repeats).\n")
+cat("At a 0.5 threshold optimized for screening, the model achieved", round(sens_05 * 100, 1), 
+    "% sensitivity and", round(spec_05 * 100, 1), "% specificity for detecting PANDAS cases.\n")
+cat("At a 0.85 threshold optimized for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+cat("Final model uses cp =", selected_cp, "(selected via one standard error rule).\n")
+```
+
+# 3. Random Forest -- No Covariates
+
+```{r}
+#------------------------------------------------------------------------
+# 3. Random Forest -- No Covariates
+#------------------------------------------------------------------------
+set.seed(2025)
+
+protein_columns <- names(PrimaryModelOne)[which(names(PrimaryModelOne) == "4E-BP1"):which(names(PrimaryModelOne) == "VEGFA")]
+protein_columns <- setdiff(protein_columns, c("CCL23", "CXCL5"))
+
+binary_raw <- PrimaryModelOne %>%
+  dplyr::select(`Unique Sample ID`, Visit, Diagnosis, `Age at First Sample`) %>%
+  left_join(NPX_raw %>% dplyr::select(-QC_Warning), by = c("Unique Sample ID", "Visit"))
+
+df_raw <- binary_raw[, c("Diagnosis", "Age at First Sample", protein_columns)]
+df_raw$Diagnosis <- factor(df_raw$Diagnosis, levels = c("PANDAS", "HC"))
+colnames(df_raw) <- make.names(colnames(df_raw))
+protein_cols <- setdiff(colnames(df_raw), c("Diagnosis", "Age.at.First.Sample"))
+
+yj_all <- preProcess(df_raw[, protein_cols], method = "YeoJohnson")
+yj_all_data <- as.matrix(predict(yj_all, df_raw[, protein_cols]))
+age_all <- df_raw$Age.at.First.Sample
+resid_all <- yj_all_data - cbind(1, age_all) %*% coef(lm(yj_all_data ~ age_all))
+
+df <- data.frame(Diagnosis = df_raw$Diagnosis, resid_all)
+
+binary_prep <- as.data.frame(binary_raw[, c("Unique Sample ID", "Diagnosis")])
+binary_prep[, protein_columns] <- as.data.frame(resid_all)
+
+# Custom caret model so the YJ transform and age residuals are refit inside each training fold
+rf_infold <- getModelInfo("rf", regex = FALSE)[[1]]
+
+rf_infold$fit <- function(x, y, wts, param, lev, last, classProbs, ...) {
+  x <- as.data.frame(x)
+  age <- x$Age.at.First.Sample
+  prot <- x[, colnames(x) != "Age.at.First.Sample", drop = FALSE]
+  yj <- preProcess(prot, method = "YeoJohnson")
+  prot_yj <- as.matrix(predict(yj, prot))
+  age_coef <- coef(lm(prot_yj ~ age))
+  prot_resid <- prot_yj - cbind(1, age) %*% age_coef
+  model <- randomForest(x = prot_resid, y = y, mtry = min(param$mtry, ncol(prot_resid)), ...)
+  model$yj <- yj
+  model$age_coef <- age_coef
+  model
+}
+
+rf_infold$predict <- function(modelFit, newdata, submodels = NULL) {
+  newdata <- as.data.frame(newdata)
+  age <- newdata$Age.at.First.Sample
+  prot <- newdata[, colnames(newdata) != "Age.at.First.Sample", drop = FALSE]
+  prot_resid <- as.matrix(predict(modelFit$yj, prot)) - cbind(1, age) %*% modelFit$age_coef
+  predict(modelFit, prot_resid)
+}
+
+rf_infold$prob <- function(modelFit, newdata, submodels = NULL) {
+  newdata <- as.data.frame(newdata)
+  age <- newdata$Age.at.First.Sample
+  prot <- newdata[, colnames(newdata) != "Age.at.First.Sample", drop = FALSE]
+  prot_resid <- as.matrix(predict(modelFit$yj, prot)) - cbind(1, age) %*% modelFit$age_coef
+  predict(modelFit, prot_resid, type = "prob")
+}
+
+rf_data <- df
+
+class_counts <- table(rf_data$Diagnosis)
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+
+rd <- df_raw
+
+cat("========== RANDOM FOREST: PANDAS vs HC ==========\n\n")
+cat("Total samples:", nrow(rf_data), "\n")
+print(table(rf_data$Diagnosis))
+cat("\n")
+
+cat("--- Cross-Validation Setup ---\n")
+cat("Method: 10-fold CV with 10 repeats\n")
+cat("mtry: sqrt(p) =", round(sqrt(length(protein_columns))), "\n")
+cat("ntree: 500\n\n")
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "all")
+
+rf_cv <- caret::train(Diagnosis ~ .,
+               data = rd,
+               method = rf_infold,
+               trControl = ctrl,
+               metric = "ROC",
+               tuneGrid = expand.grid(mtry = round(sqrt(length(protein_columns)))),
+               ntree = 500,
+               classwt = class_weights)
+
+print(rf_cv)
+
+cat("\n--- Final Random Forest ---\n\n")
+
+colnames(rf_data) <- make.names(colnames(rf_data), unique = TRUE)
+
+rf_model <- randomForest(Diagnosis ~ .,
+                         data = rf_data,
+                         ntree = 500,
+                         mtry = round(sqrt(length(protein_columns))),
+                         importance = TRUE,
+                         classwt = class_weights)
+print(rf_model)
+
+cat("\n--- OOB Error Curve ---\n\n")
+plot(rf_model, main = "OOB Error Rate by Number of Trees")
+legend("topright", colnames(rf_model$err.rate), col = 1:3, lty = 1:3)
+
+varImpPlot(rf_model, main = "Variable Importance - Random Forest")
+
+cat("\n--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+oof <- rf_cv$pred
+
+roc_cv <- roc(response = oof$obs, predictor = oof$PANDAS, levels = c("HC", "PANDAS"))
+roc_fig_rf <- roc_cv
+
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC")
+auc_cv <- auc(roc_cv)
+auc_sd <- sd(rf_cv$resample$ROC)
+
+cat("Out-of-fold AUC:", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), ")\n\n")
+
+optimal_coords <- coords(roc_cv, "best", best.method = "youden")
+optimal_threshold <- optimal_coords$threshold
+optimal_sens <- optimal_coords$sensitivity
+optimal_spec <- optimal_coords$specificity
+
+cat("--- Youden's Index ---\n")
+cat("Threshold:", round(optimal_threshold, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n\n")
+
+pred_05_cv <- ifelse(oof$PANDAS >= 0.5, "PANDAS", "HC")
+pred_opt_cv <- ifelse(oof$PANDAS >= optimal_threshold, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_opt_cv <- factor(pred_opt_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(oof$obs, levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_opt_cv <- table(Predicted = pred_opt_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_opt_cv <- sum(diag(cm_opt_cv)) / sum(cm_opt_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Default threshold\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(optimal_threshold, 3), ") ---\n")
+cat("Optimal threshold via Youden's index (maximizes sensitivity + specificity)\n")
+print(cm_opt_cv)
+cat("Accuracy:", round(acc_opt_cv, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The weighted random forest achieved an AUC of", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3),
+    ") in 10-fold cross-validation (10 repeats).\n")
+cat("At the optimal threshold of", round(optimal_threshold, 3), "(Youden's index), the model achieved",
+    round(optimal_sens * 100, 1), "% sensitivity and", round(optimal_spec * 100, 1), "% specificity.\n")
+cat("At a 0.85 threshold for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+```
+
+## 3.1 Feature Selection:
+
+```{r}
+#------------------------------------------------------------------------
+# 3.1 Feature Selection
+#------------------------------------------------------------------------
+set.seed(2025)
+
+cat("\n========== NESTED CROSS-VALIDATION FOR FEATURE SELECTION ==========\n\n")
+
+outer_folds <- createFolds(df_raw$Diagnosis, k = 10, returnTrain = FALSE)
+
+outer_predictions <- data.frame()
+
+for (i in 1:10) {
+
+  cat("Outer fold", i, "of 10\n")
+
+  test_idx <- outer_folds[[i]]
+  train_idx <- setdiff(1:nrow(df_raw), test_idx)
+
+  yj <- preProcess(df_raw[train_idx, protein_cols], method = "YeoJohnson")
+  train_yj <- as.matrix(predict(yj, df_raw[train_idx, protein_cols]))
+  test_yj <- as.matrix(predict(yj, df_raw[test_idx, protein_cols]))
+
+  age_train <- df_raw$Age.at.First.Sample[train_idx]
+  age_test <- df_raw$Age.at.First.Sample[test_idx]
+  age_fit <- lm(train_yj ~ age_train)
+  train_resid <- train_yj - cbind(1, age_train) %*% coef(age_fit)
+  test_resid <- test_yj - cbind(1, age_test) %*% coef(age_fit)
+
+  train_data <- data.frame(Diagnosis = df_raw$Diagnosis[train_idx], train_resid)
+  test_data <- data.frame(Diagnosis = df_raw$Diagnosis[test_idx], test_resid)
+
+  class_weights_inner <- c("PANDAS" = 1, "HC" = sum(train_data$Diagnosis == "PANDAS") / sum(train_data$Diagnosis == "HC"))
+
+  rf_full <- randomForest(
+    Diagnosis ~ .,
+    data = train_data,
+    ntree = 500,
+    mtry = floor(sqrt(length(protein_cols))),
+    classwt = class_weights_inner
+  )
+
+  importance_inner <- data.frame(
+    Feature = rownames(importance(rf_full)),
+    Importance = importance(rf_full)[, "MeanDecreaseGini"],
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(desc(Importance))
+
+  ctrl_inner <- trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  )
+
+  k_grid <- c(5, 10, 15, 20, 25, 30)
+  k_perf <- data.frame()
+
+  for (k in k_grid) {
+    top_k <- importance_inner$Feature[1:k]
+    train_k <- train_data[, c("Diagnosis", top_k)]
+
+    rf_k <- caret::train(
+      Diagnosis ~ .,
+      data = train_k,
+      method = "rf",
+      trControl = ctrl_inner,
+      metric = "ROC",
+      tuneGrid = expand.grid(mtry = floor(sqrt(k))),
+      ntree = 500,
+      classwt = class_weights_inner
+    )
+
+    k_perf <- rbind(k_perf, data.frame(k = k, ROC = mean(rf_k$resample$ROC), SD = sd(rf_k$resample$ROC)))
+  }
+
+  best_k <- k_perf$k[which.max(k_perf$ROC)]
+  best_ROC <- max(k_perf$ROC)
+  best_SD <- k_perf$SD[which.max(k_perf$ROC)]
+  threshold_ROC <- best_ROC - best_SD
+  eligible_k <- k_perf$k[k_perf$ROC >= threshold_ROC]
+  chosen_k <- min(eligible_k)
+
+  cat("  Chosen k =", chosen_k, "\n")
+
+  selected_features <- importance_inner$Feature[1:chosen_k]
+
+  train_final <- train_data[, c("Diagnosis", selected_features)]
+  test_final <- test_data[, c("Diagnosis", selected_features)]
+
+  rf_final <- randomForest(
+    Diagnosis ~ .,
+    data = train_final,
+    ntree = 500,
+    mtry = floor(sqrt(chosen_k)),
+    classwt = class_weights_inner
+  )
+
+  test_probs <- predict(rf_final, test_final, type = "prob")
+
+  fold_preds <- data.frame(
+    obs = test_data$Diagnosis,
+    PANDAS = test_probs[, "PANDAS"],
+    HC = test_probs[, "HC"],
+    pred = predict(rf_final, test_final),
+    outer_fold = i,
+    chosen_k = chosen_k
+  )
+
+  outer_predictions <- rbind(outer_predictions, fold_preds)
+}
+
+cat("\n========== NESTED CV RESULTS ==========\n\n")
+
+roc_nested <- roc(response = outer_predictions$obs, predictor = outer_predictions$PANDAS, levels = c("HC", "PANDAS"))
+auc_nested <- as.numeric(auc(roc_nested))
+
+cat("Nested CV AUC:", round(auc_nested, 3), "\n\n")
+
+cat("Features selected per fold:\n")
+print(table(outer_predictions$chosen_k))
+
+coords_nested <- coords(roc_nested, "best", ret = c("threshold", "sensitivity", "specificity"))
+youden_thresh <- coords_nested$threshold
+
+cat("\nOptimal threshold (Youden):", round(youden_thresh, 3), "\n")
+cat("Sensitivity:", round(coords_nested$sensitivity, 3), "\n")
+cat("Specificity:", round(coords_nested$specificity, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.5) ---\n")
+outer_predictions$pred_0.5 <- ifelse(outer_predictions$PANDAS >= 0.5, "PANDAS", "HC")
+outer_predictions$pred_0.5 <- factor(outer_predictions$pred_0.5, levels = c("PANDAS", "HC"))
+print(table(Predicted = outer_predictions$pred_0.5, Actual = outer_predictions$obs))
+cat("Sensitivity:", round(sum(outer_predictions$pred_0.5 == "PANDAS" & outer_predictions$obs == "PANDAS") / sum(outer_predictions$obs == "PANDAS"), 3), "\n")
+cat("Specificity:", round(sum(outer_predictions$pred_0.5 == "HC" & outer_predictions$obs == "HC") / sum(outer_predictions$obs == "HC"), 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(youden_thresh, 3), ", Youden) ---\n")
+outer_predictions$pred_youden <- ifelse(outer_predictions$PANDAS >= youden_thresh, "PANDAS", "HC")
+outer_predictions$pred_youden <- factor(outer_predictions$pred_youden, levels = c("PANDAS", "HC"))
+print(table(Predicted = outer_predictions$pred_youden, Actual = outer_predictions$obs))
+cat("Sensitivity:", round(sum(outer_predictions$pred_youden == "PANDAS" & outer_predictions$obs == "PANDAS") / sum(outer_predictions$obs == "PANDAS"), 3), "\n")
+cat("Specificity:", round(sum(outer_predictions$pred_youden == "HC" & outer_predictions$obs == "HC") / sum(outer_predictions$obs == "HC"), 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+outer_predictions$pred_0.85 <- ifelse(outer_predictions$PANDAS >= 0.85, "PANDAS", "HC")
+outer_predictions$pred_0.85 <- factor(outer_predictions$pred_0.85, levels = c("PANDAS", "HC"))
+print(table(Predicted = outer_predictions$pred_0.85, Actual = outer_predictions$obs))
+cat("Sensitivity:", round(sum(outer_predictions$pred_0.85 == "PANDAS" & outer_predictions$obs == "PANDAS") / sum(outer_predictions$obs == "PANDAS"), 3), "\n")
+cat("Specificity:", round(sum(outer_predictions$pred_0.85 == "HC" & outer_predictions$obs == "HC") / sum(outer_predictions$obs == "HC"), 3), "\n")
+```
+
+```{r}
+set.seed(2025)
+roc_nested <- roc(response = outer_predictions$obs, predictor = outer_predictions$PANDAS, levels = c("HC", "PANDAS"))
+
+plot(roc_nested, main = paste0("Nested CV ROC Curve (AUC = ", round(auc(roc_nested), 2), ")"), col = "darkblue", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+cat("\n--- Binary Feature Selection Stability (10 repeats x 10 folds) ---\n\n")
+
+feature_tracker <- list()
+
+set.seed(2025)
+
+for (r in 1:10) {
+
+  outer_folds_r <- createFolds(df_raw$Diagnosis, k = 10, returnTrain = FALSE)
+
+  for (i in 1:10) {
+
+    test_idx <- outer_folds_r[[i]]
+    train_idx <- setdiff(1:nrow(df_raw), test_idx)
+
+    yj <- preProcess(df_raw[train_idx, protein_cols], method = "YeoJohnson")
+    train_yj <- as.matrix(predict(yj, df_raw[train_idx, protein_cols]))
+
+    age_train <- df_raw$Age.at.First.Sample[train_idx]
+    age_fit <- lm(train_yj ~ age_train)
+    train_resid <- train_yj - cbind(1, age_train) %*% coef(age_fit)
+
+    train_data <- data.frame(Diagnosis = df_raw$Diagnosis[train_idx], train_resid)
+
+    class_weights_inner <- c("PANDAS" = 1, "HC" = sum(train_data$Diagnosis == "PANDAS") / sum(train_data$Diagnosis == "HC"))
+
+    rf_full <- randomForest(
+      Diagnosis ~ .,
+      data = train_data,
+      ntree = 500,
+      mtry = floor(sqrt(length(protein_cols))),
+      classwt = class_weights_inner
+    )
+
+    importance_inner <- data.frame(
+      Feature = rownames(importance(rf_full)),
+      Importance = importance(rf_full)[, "MeanDecreaseGini"],
+      stringsAsFactors = FALSE
+    ) %>%
+      arrange(desc(Importance))
+
+    feature_tracker[[length(feature_tracker) + 1]] <- importance_inner$Feature[1:5]
+  }
+}
+
+all_selected <- unlist(feature_tracker)
+feature_counts <- sort(table(all_selected), decreasing = TRUE)
+
+cat("Percent of 100 training folds with protein in top 5:\n")
+print(feature_counts)
+
+cat("\nProteins in top 5 in at least 60% of folds:\n")
+print(names(feature_counts)[feature_counts >= 60])
+```
+
+## 3.6.1 Final model with selected proteins
+
+```{r}
+#------------------------------------------------------------------------
+# 3.6.1 Final model with selected proteins
+#------------------------------------------------------------------------
+set.seed(2025)
+
+# The 3 proteins that were in the top 5 in at least 60% of folds
+top3_features <- c("X4E.BP1", "IL8", "TNFSF14")
+rf3 <- df_raw[, c("Diagnosis", "Age.at.First.Sample", top3_features)]
+
+ctrl_50 <- trainControl(method = "repeatedcv",
+                        number = 10,
+                        repeats = 50,
+                        classProbs = TRUE,
+                        summaryFunction = twoClassSummary,
+                        savePredictions = "all")
+
+rf_cv3 <- caret::train(
+  Diagnosis ~ .,
+  data = rf3,
+  method = rf_infold,
+  trControl = ctrl_50,
+  metric = "ROC",
+  tuneGrid = expand.grid(mtry = round(sqrt(3))),
+  ntree = 1000,
+  classwt = class_weights
+)
+
+cat("\n===== FINAL RF MODEL WITH TOP 3 FEATURES (50x10 CV, 1000 trees) =====\n")
+print(rf_cv3)
+
+oof3 <- rf_cv3$pred
+
+roc3 <- roc(
+  response = oof3$obs,
+  predictor = oof3$PANDAS,
+  levels = c("HC", "PANDAS")
+)
+
+plot(roc3, main = "ROC Curve: Top 3 Proteins (50x10 CV)")
+
+auc3 <- auc(roc3)
+auc3_sd <- sd(rf_cv3$resample$ROC)
+
+cat("\nCross-Validated AUC (Top 3):", round(as.numeric(auc3), 3),
+    "(SD:", round(auc3_sd, 3), ")\n")
+
+coords3 <- coords(roc3, "best", best.method = "youden")
+thresh3 <- coords3$threshold
+sens3 <- coords3$sensitivity
+spec3 <- coords3$specificity
+
+cat("\nOptimal threshold (Youden):", round(thresh3, 3),
+    "| Sens:", round(sens3, 3),
+    "| Spec:", round(spec3, 3), "\n")
+
+pred_05_3 <- ifelse(oof3$PANDAS >= 0.5, "PANDAS", "HC")
+pred_opt3 <- ifelse(oof3$PANDAS >= thresh3, "PANDAS", "HC")
+pred_085_3 <- ifelse(oof3$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_3 <- factor(pred_05_3, levels = c("PANDAS", "HC"))
+pred_opt3 <- factor(pred_opt3, levels = c("PANDAS", "HC"))
+pred_085_3 <- factor(pred_085_3, levels = c("PANDAS", "HC"))
+
+actual3 <- factor(oof3$obs, levels = c("PANDAS", "HC"))
+
+cm_05_3 <- table(Predicted = pred_05_3, Actual = actual3)
+cm_opt3 <- table(Predicted = pred_opt3, Actual = actual3)
+cm_085_3 <- table(Predicted = pred_085_3, Actual = actual3)
+
+sens_05 <- cm_05_3["PANDAS", "PANDAS"] / sum(cm_05_3[, "PANDAS"])
+spec_05 <- cm_05_3["HC", "HC"] / sum(cm_05_3[, "HC"])
+
+sens_085 <- cm_085_3["PANDAS", "PANDAS"] / sum(cm_085_3[, "PANDAS"])
+spec_085 <- cm_085_3["HC", "HC"] / sum(cm_085_3[, "HC"])
+
+cat("\n--- Confusion Matrix (threshold = 0.5) ---\n")
+print(cm_05_3)
+cat("Accuracy:", round(sum(diag(cm_05_3)) / sum(cm_05_3), 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(thresh3, 3), ") ---\n")
+print(cm_opt3)
+cat("Accuracy:", round(sum(diag(cm_opt3)) / sum(cm_opt3), 3), "\n")
+cat("Sensitivity:", round(sens3, 3), "| Specificity:", round(spec3, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+print(cm_085_3)
+cat("Accuracy:", round(sum(diag(cm_085_3)) / sum(cm_085_3), 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The Random Forest with top 3 proteins achieved an AUC of", round(as.numeric(auc3), 3),
+    "(SD:", round(auc3_sd, 3), ") in 10-fold cross-validation (50 repeats).\n")
+cat("At the optimal threshold of", round(thresh3, 3), "(Youden's index), the model achieved",
+    round(sens3 * 100, 1), "% sensitivity and", round(spec3 * 100, 1), "% specificity.\n")
+
+importance_df3 <- data.frame(
+  Protein = rownames(rf_cv3$finalModel$importance),
+  Importance = rf_cv3$finalModel$importance[, "MeanDecreaseGini"]
+) %>%
+  arrange(desc(Importance))
+
+print(importance_df3)
+```
+
+### 3.6 ROC
+
+```{r}
+#------------------------------------------------------------------------
+# 3.6 ROC
+#------------------------------------------------------------------------
+# Average each subject's out of fold probability over the 50 repeats before the ROC
+subj3 <- aggregate(PANDAS ~ rowIndex, data = oof3, FUN = mean)
+subj3$obs <- oof3$obs[match(subj3$rowIndex, oof3$rowIndex)]
+roc3_subj <- roc(response = subj3$obs, predictor = subj3$PANDAS, levels = c("HC", "PANDAS"), direction = "<")
+ci3 <- ci.auc(roc3_subj)
+nrow(subj3)
+round(as.numeric(auc(roc3_subj)), 3)
+round(as.numeric(ci3), 3)
+```
+
+```{r}
+par(mar = c(4.2, 4.2, 1.2, 1.2), xaxs = "i", yaxs = "i", las = 1)
+plot(roc3,
+     xlim = c(1, 0), ylim = c(0, 1),
+     xlab = "Specificity", ylab = "Sensitivity",
+     lwd = 2.5, col = "black",
+     identity = TRUE, identity.col = "grey65", identity.lty = 2, identity.lwd = 1,
+     grid = c(0.2, 0.2), grid.col = "grey92",
+     axes = FALSE, mgp = c(2.4, 0.7, 0), cex.lab = 1.05)
+axis(1, at = seq(1, 0, by = -0.2), labels = sprintf("%.1f", seq(1, 0, by = -0.2)), cex.axis = 0.95)
+axis(2, at = seq(0, 1, by = 0.2), labels = sprintf("%.1f", seq(0, 1, by = 0.2)), cex.axis = 0.95)
+box(col = "grey40")
+text(0.55, 0.10, paste0("AUC = ", sprintf("%.2f", as.numeric(auc3)),
+                        " (95% CI, ", sprintf("%.2f", ci3[1]),
+                        "-", sprintf("%.2f", ci3[3]), ")"), adj = 0, cex = 1)
+points(spec3, sens3, pch = 21, bg = "white", col = "black", cex = 1.1)
+```
+
+ROC polished for manuscript
+
+```{r}
+library(patchwork)
+
+yd3 <- coords(roc3, "best", best.method = "youden", ret = c("threshold", "specificity", "sensitivity"))
+yd7 <- coords(roc7, "best", best.method = "youden", ret = c("threshold", "specificity", "sensitivity"))
+yd3
+yd7
+round(as.numeric(auc(roc3_subj)), 3)
+round(as.numeric(auc(roc7_subj)), 3)
+
+roc3_df <- data.frame(spec = roc3_subj$specificities, sens = roc3_subj$sensitivities)
+roc7_df <- data.frame(spec = roc7_subj$specificities, sens = roc7_subj$sensitivities)
+
+theme_roc <- theme_classic(base_size = 10, base_family = "Arial") +
+  theme(
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    plot.title = element_text(face = "bold", size = 10, hjust = 0),
+    panel.grid.major = element_line(color = "grey92", linewidth = 0.3),
+    aspect.ratio = 1
+  )
+
+p_roc3 <- ggplot(roc3_df, aes(x = spec, y = sens)) +
+  annotate("segment", x = 1, xend = 0, y = 0, yend = 1, linetype = "dashed", color = "grey60", linewidth = 0.4) +
+  geom_path(linewidth = 0.9, color = "black") +
+  annotate("point", x = yd3$specificity, y = yd3$sensitivity, shape = 21, fill = "white", color = "black", size = 2.5, stroke = 0.8) +
+  annotate("text", x = yd3$specificity - 0.04, y = yd3$sensitivity - 0.06, hjust = 0, size = 3,
+           label = sprintf("Youden threshold, %.2f\nSensitivity %.1f%%, specificity %.1f%%",
+                           yd3$threshold, 100 * yd3$sensitivity, 100 * yd3$specificity)) +
+  annotate("text", x = 0.02, y = 0.06, hjust = 1, size = 3.2,
+           label = sprintf("AUC = %.2f (95%% CI, %.2f-%.2f)", as.numeric(auc(roc3_subj)), ci3[1], ci3[3])) +
+  scale_x_reverse(limits = c(1, 0), breaks = seq(0, 1, 0.2), labels = sprintf("%.1f", seq(0, 1, 0.2)), expand = c(0.01, 0)) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2), labels = sprintf("%.1f", seq(0, 1, 0.2)), expand = c(0.01, 0)) +
+  labs(title = "PANDAS vs HC (3 proteins)", x = "Specificity", y = "Sensitivity") +
+  theme_roc
+
+p_roc7 <- ggplot(roc7_df, aes(x = spec, y = sens)) +
+  annotate("segment", x = 1, xend = 0, y = 0, yend = 1, linetype = "dashed", color = "grey60", linewidth = 0.4) +
+  geom_path(linewidth = 0.9, color = "black") +
+  annotate("point", x = yd7$specificity, y = yd7$sensitivity, shape = 21, fill = "white", color = "black", size = 2.5, stroke = 0.8) +
+  annotate("text", x = yd7$specificity - 0.04, y = yd7$sensitivity - 0.06, hjust = 0, size = 3,
+           label = sprintf("Youden threshold, %.2f\nSensitivity %.1f%%, specificity %.1f%%",
+                           yd7$threshold, 100 * yd7$sensitivity, 100 * yd7$specificity)) +
+  annotate("text", x = 0.02, y = 0.06, hjust = 1, size = 3.2,
+           label = sprintf("AUC = %.2f (95%% CI, %.2f-%.2f)", as.numeric(auc(roc7_subj)), ci7[1], ci7[3])) +
+  scale_x_reverse(limits = c(1, 0), breaks = seq(0, 1, 0.2), labels = sprintf("%.1f", seq(0, 1, 0.2)), expand = c(0.01, 0)) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2), labels = sprintf("%.1f", seq(0, 1, 0.2)), expand = c(0.01, 0)) +
+  labs(title = "PANDAS vs OCD and R-ED (7 proteins)", x = "Specificity", y = "Sensitivity") +
+  theme_roc
+
+fig2 <- p_roc3 + p_roc7 +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 12, family = "Arial"))
+fig2
+
+ggsave("Figure2_ROC.pdf", fig2, width = 7.5, height = 3.9, device = cairo_pdf)
+ggsave("Figure2_ROC.tiff", fig2, width = 7.5, height = 3.9, dpi = 600, compression = "lzw")
+```
+
+
+## 3.6.2 Heatmap
+
+```{r}
+#------------------------------------------------------------------------
+# 3.6.2 Heatmap
+#------------------------------------------------------------------------
+
+set.seed(2025)
+
+top3_features <- c("X4E.BP1", "IL8", "TNFSF14")
+
+name_map <- setNames(names(binary_prep), make.names(names(binary_prep)))
+original_names3 <- name_map[top3_features]
+
+cat("Top 3 features (original names):\n")
+print(original_names3)
+
+df3 <- binary_prep[, c("Unique Sample ID", "Diagnosis", original_names3)]
+df3$Diagnosis <- factor(df3$Diagnosis, levels = c("HC", "PANDAS"))
+
+unique_ids <- make.unique(as.character(df3$`Unique Sample ID`))
+
+heatmap_matrix3 <- as.matrix(df3[, original_names3])
+rownames(heatmap_matrix3) <- unique_ids
+
+heatmap_scaled3 <- scale(heatmap_matrix3)
+
+annotation_row3 <- data.frame(Diagnosis = df3$Diagnosis)
+rownames(annotation_row3) <- unique_ids
+
+annotation_colors3 <- list(
+  Diagnosis = c("HC" = "#377EB8", "PANDAS" = "#E41A1C")
+)
+
+sample_order <- order(df3$Diagnosis)
+
+pheatmap(
+  heatmap_scaled3[sample_order, ],
+  annotation_row    = annotation_row3,
+  annotation_colors = annotation_colors3,
+  cluster_cols      = TRUE,
+  cluster_rows      = FALSE,
+  show_rownames     = FALSE,
+  main              = "Heatmap of Top 3 Proteins",
+  fontsize_col      = 10,
+  border_color      = NA,
+  color             = colorRampPalette(c("#7B3294", "white", "#008837"))(100)
+)
+
+umap_sup3 <- umap(
+  heatmap_scaled3,
+  y             = df3$Diagnosis,
+  target_weight = 0.8,
+  n_neighbors   = 15,
+  min_dist      = 0.2,
+  metric        = "euclidean",
+  verbose       = TRUE
+)
+
+df_umap3 <- data.frame(
+  UMAP1     = umap_sup3[, 1],
+  UMAP2     = umap_sup3[, 2],
+  Diagnosis = df3$Diagnosis
+)
+
+ggplot(df_umap3, aes(UMAP1, UMAP2, color = Diagnosis)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(level = 0.8, alpha = 0.15) +
+  scale_color_manual(values = c("HC" = "#377EB8", "PANDAS" = "#E41A1C")) +
+  theme_classic(base_size = 14) +
+  ggtitle("Supervised UMAP – Top 3 Proteins")
+
+pca3 <- prcomp(heatmap_scaled3, scale. = FALSE)
+
+df_pca3 <- data.frame(
+  PC1       = pca3$x[, 1],
+  PC2       = pca3$x[, 2],
+  Diagnosis = df3$Diagnosis
+)
+
+ggplot(df_pca3, aes(PC1, PC2, color = Diagnosis)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_color_manual(values = c("HC" = "#377EB8", "PANDAS" = "#E41A1C")) +
+  theme_classic(base_size = 14) +
+  ggtitle("PCA – Top 3 Proteins")
+```
+
+Umap Unsup
+```{r}
+umap_unsup3 <- umap(
+  heatmap_scaled3,
+  n_neighbors = 15,
+  min_dist = 0.2,
+  metric = "euclidean",
+  verbose = TRUE
+)
+
+df_umap_unsup3 <- data.frame(
+  UMAP1 = umap_unsup3[,1],
+  UMAP2 = umap_unsup3[,2],
+  Diagnosis = df3$Diagnosis
+)
+
+ggplot(df_umap_unsup3, aes(UMAP1, UMAP2, color = Diagnosis, fill = Diagnosis)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(level = 0.8, linetype = "dashed", linewidth = 0.7) +
+  scale_color_manual(values = c("HC" = "#377EB8", "PANDAS" = "#E41A1C")) +
+  scale_fill_manual(values = c("HC" = "#377EB8", "PANDAS" = "#E41A1C")) +
+  theme_classic(base_size = 14) +
+  ggtitle("Unsupervised UMAP – Top 3 Proteins")
+```
+
+Polished UMAP Figure 3:
+
+```{r}
+set.seed(2025)
+conflicted::conflicts_prefer(ggplot2::margin)
+umap_unsup3 <- umap(
+  heatmap_scaled3,
+  n_neighbors = 15,
+  min_dist = 0.2,
+  metric = "euclidean",
+  verbose = TRUE
+)
+
+df_umap_unsup3 <- data.frame(
+  UMAP1 = umap_unsup3[,1],
+  UMAP2 = umap_unsup3[,2],
+  Diagnosis = df3$Diagnosis
+)
+df_umap_unsup3$Diagnosis <- factor(df_umap_unsup3$Diagnosis, levels = c("PANDAS", "HC"))
+set.seed(2025)
+
+umap_unsup7 <- umap(
+  heatmap_scaled7,
+  n_neighbors = 15,
+  min_dist = 0.2,
+  metric = "euclidean",
+  verbose = TRUE
+)
+
+df_umap_unsup7 <- data.frame(
+  UMAP1 = umap_unsup7[,1],
+  UMAP2 = umap_unsup7[,2],
+  Diagnosis = df7_viz$Diagnosis
+)
+df_umap_unsup7$Diagnosis <- as.character(df_umap_unsup7$Diagnosis)
+df_umap_unsup7$Diagnosis[df_umap_unsup7$Diagnosis == "AN/ARFID"] <- "R-ED"
+df_umap_unsup7$Diagnosis <- factor(df_umap_unsup7$Diagnosis, levels = c("PANDAS", "OCD", "R-ED"))
+theme_umap <- theme_classic(base_size = 10, base_family = "Arial") +
+  theme(
+    axis.title = element_text(face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.title = element_text(face = "bold", size = 10, hjust = 0),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9),
+    legend.margin = margin(0, 0, 0, 0),
+    aspect.ratio = 1
+  )
+
+p_umap3 <- ggplot(df_umap_unsup3, aes(UMAP1, UMAP2, color = Diagnosis, shape = Diagnosis)) +
+  geom_point(size = 1.6, alpha = 0.7) +
+  scale_color_manual(values = c("PANDAS" = "#E41A1C", "HC" = "#377EB8")) +
+  scale_shape_manual(values = c("PANDAS" = 16, "HC" = 17)) +
+  guides(color = guide_legend(override.aes = list(size = 2.5, alpha = 1))) +
+  labs(title = "PANDAS vs HC (3 proteins)", x = "UMAP1", y = "UMAP2") +
+  theme_umap
+
+p_umap7 <- ggplot(df_umap_unsup7, aes(UMAP1, UMAP2, color = Diagnosis, shape = Diagnosis)) +
+  geom_point(size = 1.6, alpha = 0.7) +
+  scale_color_manual(values = c("PANDAS" = "#E41A1C", "OCD" = "#984EA3", "R-ED" = "#4DAF4A")) +
+  scale_shape_manual(values = c("PANDAS" = 16, "OCD" = 17, "R-ED" = 15)) +
+  guides(color = guide_legend(override.aes = list(size = 2.5, alpha = 1))) +
+  labs(title = "PANDAS vs OCD and R-ED (7 proteins)", x = "UMAP1", y = "UMAP2") +
+  theme_umap
+
+fig3 <- p_umap3 + p_umap7 +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 12, family = "Arial"))
+fig3
+
+ggsave("Figure3_UMAP.pdf", fig3, width = 7.5, height = 4.2, device = cairo_pdf)
+ggsave("Figure3_UMAP.tiff", fig3, width = 7.5, height = 4.2, dpi = 600, compression = "lzw")
+```
+
+
+
+## 3.7 Simulations
+
+```{r}
+#------------------------------------------------------------------------
+# 3.7 Simulations
+#------------------------------------------------------------------------
+cat("\n========== PATIENT SIMULATIONS (3-PROTEIN PANEL) ==========\n\n")
+
+set.seed(2025)
+
+rf3_data <- df[, c("Diagnosis", top3_features)]
+rf_model3 <- rf_cv3$finalModel
+protein_cols3 <- top3_features
+
+cov_matrix3 <- cov(rf3_data[, protein_cols3])
+
+all_probs3 <- predict(rf_model3, rf3_data, type = "prob")[, "PANDAS"]
+
+rf3_with_probs <- rf3_data
+rf3_with_probs$model_prob <- all_probs3
+rf3_with_probs$original_diagnosis <- rf3_data$Diagnosis
+
+hc_patients <- rf3_with_probs[rf3_with_probs$original_diagnosis == "HC", ]
+pandas_patients <- rf3_with_probs[rf3_with_probs$original_diagnosis == "PANDAS", ]
+
+all_probs3 <- rf_model3$votes[, "PANDAS"]
+
+templates_aim1 <- rbind(
+  hc_patients[which.min(abs(hc_patients$model_prob - quantile(hc_patients$model_prob, 0.10))), ],
+  hc_patients[which.min(abs(hc_patients$model_prob - quantile(hc_patients$model_prob, 0.50))), ],
+  hc_patients[which.min(abs(hc_patients$model_prob - quantile(hc_patients$model_prob, 0.90))), ],
+  pandas_patients[which.min(abs(pandas_patients$model_prob - quantile(pandas_patients$model_prob, 0.10))), ],
+  pandas_patients[which.min(abs(pandas_patients$model_prob - quantile(pandas_patients$model_prob, 0.50))), ],
+  pandas_patients[which.min(abs(pandas_patients$model_prob - quantile(pandas_patients$model_prob, 0.90))), ]
+)
+
+patient_labels_aim1 <- c(
+  "HC, low predicted probability",
+  "HC, intermediate predicted probability",
+  "HC, high predicted probability",
+  "PANDAS, low predicted probability",
+  "PANDAS, intermediate predicted probability",
+  "PANDAS, high predicted probability"
+)
+
+n_perturb <- 100
+stability_results_aim1 <- data.frame()
+
+for (i in 1:nrow(templates_aim1)) {
+  base <- templates_aim1[i, ]
+  probs <- numeric(n_perturb)
+
+  for (j in 1:n_perturb) {
+    # Noise is 15% of the SD and keeps the correlation between proteins
+    noise <- mvrnorm(1, mu = rep(0, length(protein_cols3)), Sigma = cov_matrix3 * 0.15^2)
+    variant <- base[, protein_cols3]
+    variant[1, ] <- as.numeric(variant) + noise
+    probs[j] <- predict(rf_model3, variant, type = "prob")[, "PANDAS"]
+  }
+
+  stability_results_aim1 <- rbind(stability_results_aim1, data.frame(
+    Patient = patient_labels_aim1[i],
+    True_Diagnosis = as.character(base$original_diagnosis),
+    Template_P_PANDAS = base$model_prob,
+    Mean_P_PANDAS = mean(probs),
+    SD_P_PANDAS = sd(probs),
+    Cross_0.5 = sum(probs >= 0.5),
+    Cross_Youden = sum(probs >= thresh3),
+    Cross_0.85 = sum(probs >= 0.85)
+  ))
+}
+
+print(stability_results_aim1)
+```
+
+```{r}
+sim_table_aim1 <- stability_results_aim1[, c("Patient", "Mean_P_PANDAS", "SD_P_PANDAS", "Cross_0.5", "Cross_Youden", "Cross_0.85")]
+
+sim_table_aim1$Mean_P_PANDAS <- round(sim_table_aim1$Mean_P_PANDAS, 2)
+sim_table_aim1$SD_P_PANDAS <- round(sim_table_aim1$SD_P_PANDAS, 2)
+
+kable(sim_table_aim1,
+      col.names = c("Patient Profile", "Mean P(PANDAS)", "SD",
+                    "Screening (0.50), %",
+                    paste0("Confirmatory (", round(thresh3, 2), "), %"),
+                    "High-Specificity (0.85), %"),
+      row.names = FALSE,
+      caption = "Table X. Stability of PANDAS vs HC Classification Under Local Perturbation (n = 100 simulations per profile)",
+      align = c("l", "c", "c", "c", "c", "c")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12) %>%
+  add_header_above(c(" " = 3, "% Crossing Threshold" = 3)) %>%
+  footnote(general = "Perturbations added Gaussian noise proportional to protein variance while preserving correlation structure.")
+```
+
+## 3.8 Interpretability
+
+```{r}
+#------------------------------------------------------------------------
+# 3.8 Interpretability
+#------------------------------------------------------------------------
+cat("\n========== RANDOM FOREST INTERPRETABILITY ==========\n\n")
+
+cat("--- 1. Direction of Effect (Mean Protein Levels by Diagnosis) ---\n\n")
+
+top3_proteins <- top3_features
+
+direction_df <- data.frame(Protein = top3_proteins)
+
+direction_df$Mean_PANDAS <- sapply(top3_proteins, function(p) mean(rf3_data[[p]][rf3_data$Diagnosis == "PANDAS"]))
+direction_df$Mean_HC <- sapply(top3_proteins, function(p) mean(rf3_data[[p]][rf3_data$Diagnosis == "HC"]))
+direction_df$SD_PANDAS <- sapply(top3_proteins, function(p) sd(rf3_data[[p]][rf3_data$Diagnosis == "PANDAS"]))
+direction_df$SD_HC <- sapply(top3_proteins, function(p) sd(rf3_data[[p]][rf3_data$Diagnosis == "HC"]))
+
+direction_df$Difference <- direction_df$Mean_PANDAS - direction_df$Mean_HC
+direction_df$Direction <- ifelse(direction_df$Difference > 0, "Higher in PANDAS", "Lower in PANDAS")
+direction_df$Effect_Size <- direction_df$Difference / sqrt((direction_df$SD_PANDAS^2 + direction_df$SD_HC^2) / 2)
+
+direction_df <- merge(importance_df3, direction_df, by = "Protein")
+direction_df <- direction_df[order(-direction_df$Importance), ]
+
+cat("Top 3 Proteins - Direction and Effect Size:\n\n")
+print(direction_df[, c("Protein", "Importance", "Mean_PANDAS", "Mean_HC", "Direction", "Effect_Size")])
+```
+
+```{r}
+results_table <- direction_df[, c("Protein", "Importance", "Mean_PANDAS", "Mean_HC", "Direction", "Effect_Size")]
+
+results_table$Importance <- round(results_table$Importance, 2)
+results_table$Mean_PANDAS <- round(results_table$Mean_PANDAS, 3)
+results_table$Mean_HC <- round(results_table$Mean_HC, 3)
+results_table$Effect_Size <- round(results_table$Effect_Size, 2)
+
+results_table$Rank <- 1:nrow(results_table)
+results_table <- results_table[, c("Rank", "Protein", "Importance", "Mean_PANDAS", "Mean_HC", "Direction", "Effect_Size")]
+
+kable(results_table,
+      col.names = c("Rank", "Protein", "Importance (Gini)", "Mean (PANDAS)", "Mean (HC)", "Direction", "Cohen's d"),
+      row.names = FALSE,
+      caption = "Table X. Top 3 Discriminatory Proteins from Random Forest Classification",
+      align = c("c", "l", "c", "c", "c", "l", "c")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12) %>%
+  add_header_above(c(" " = 3, "NPX Expression" = 2, " " = 2)) %>%
+  footnote(general = "Importance based on Mean Decrease in Gini impurity. Effect size interpreted as: |d| < 0.2 = negligible, 0.2-0.5 = small, 0.5-0.8 = medium, > 0.8 = large.")
+```
+
+```{r}
+cat("\n=== Partial Dependence Plots (Top 3 Proteins) ===\n\n")
+
+protein_labels3 <- c("4E-BP1", "IL-8", "TNFSF14")
+
+theme_jama <- theme_classic(base_size = 10) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    axis.title = element_text(size = 9, face = "bold"),
+    plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.3)
+  )
+
+pdp_list <- list()
+plot_list <- list()
+
+for (i in 1:3) {
+  protein <- top3_proteins[i]
+  label <- protein_labels3[i]
+  
+  grid_vals <- seq(min(rf3_data[[protein]]), max(rf3_data[[protein]]), length.out = 51)
+  yhat <- c()
+  
+  for (g in grid_vals) {
+    temp <- rf3_data
+    temp[[protein]] <- g
+    yhat <- c(yhat, mean(predict(rf_cv3$finalModel, temp, type = "prob")[, "PANDAS"]))
+  }
+  
+  pdp_list[[protein]] <- data.frame(grid_vals, yhat)
+  names(pdp_list[[protein]]) <- c(protein, "yhat")
+  
+  plot_list[[i]] <- ggplot(pdp_list[[protein]], aes_string(x = protein, y = "yhat")) + 
+    geom_line(linewidth = 1, color = "black") + 
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+    theme_jama + 
+    labs(x = paste0(label, " (pre-processed)"), y = "P(PANDAS)") +
+    ylim(0, 1)
+}
+
+grid.arrange(grobs = plot_list, ncol = 3,
+             top = "Partial Dependence Plots: Effect of Protein Level on PANDAS Probability")
+
+ggsave("partial_dependence_plots_top3.png", 
+       arrangeGrob(grobs = plot_list, ncol = 3,
+                   top = "Partial Dependence Plots: Effect of Protein Level on PANDAS Probability"),
+       width = 10, height = 4, dpi = 300)
+```
+
+```{r}
+protein_labels3 <- c("4E-BP1", "IL-8", "TNFSF14")
+original_names3_clean <- unname(original_names3)
+names(protein_labels3) <- original_names3_clean
+
+plot_data <- binary_prep[, c("Unique Sample ID", "Diagnosis", original_names3_clean)]
+
+plot_long <- plot_data %>%
+  pivot_longer(cols = all_of(original_names3_clean),
+               names_to = "Protein",
+               values_to = "NPX")
+
+plot_long$Protein <- factor(plot_long$Protein, levels = original_names3_clean)
+plot_long$Diagnosis <- factor(plot_long$Diagnosis, levels = c("HC", "PANDAS"))
+
+theme_jama <- theme_classic(base_size = 11, base_family = "Arial") +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 9),
+    axis.title = element_text(size = 11, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.3)
+  )
+
+p1 <- ggplot(plot_long, aes(x = Diagnosis, y = NPX, fill = Diagnosis)) +
+  geom_boxplot(color = "black", outlier.shape = 21, outlier.fill = "white",
+               outlier.size = 1.5, linewidth = 0.4) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5, color = "black") +
+  scale_fill_manual(values = c("HC" = "#377EB8", "PANDAS" = "#E41A1C")) +
+  facet_wrap(~ Protein, scales = "free_y", ncol = 3, labeller = labeller(Protein = protein_labels3)) +
+  labs(
+    title = "Distribution of Top 3 Discriminatory Proteins by Diagnosis",
+    x = "Diagnosis",
+    y = "NPX (Age-Adjusted Residuals)"
+  ) +
+  theme_jama
+p1
+ggsave("binary_top3_proteins_by_diagnosis.png", width = 10, height = 6, dpi = 300)
+```
+
+# 4. Random Forest -- With Covariates
+Demographics don't help
+
+```{r}
+#------------------------------------------------------------------------
+# 4. Random Forest -- With Covariates
+#------------------------------------------------------------------------
+set.seed(2025) # For reproducibility
+
+rf_data <- PrimaryModelOne[, c("Diagnosis", "Race", "Ethnicity", "Sex", protein_columns)]
+rf_data$Diagnosis <- as.factor(rf_data$Diagnosis)
+rf_data <- na.omit(rf_data)
+names(rf_data) <- make.names(names(rf_data))
+
+train_index <- createDataPartition(rf_data$Diagnosis, p = 0.8, list = FALSE)
+train_data <- rf_data[train_index, ]
+test_data <- rf_data[-train_index, ]
+
+class_counts <- table(train_data$Diagnosis)
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+
+rf_model <- randomForest(Diagnosis ~ ., 
+                         data = train_data, 
+                         ntree = 1000, 
+                         mtry = sqrt(ncol(train_data) - 1), 
+                         importance = TRUE, 
+                         classwt = class_weights)
+
+print(rf_model)
+
+rf_predictions <- predict(rf_model, test_data, type = "class")
+rf_conf_matrix <- confusionMatrix(rf_predictions, test_data$Diagnosis)
+print(rf_conf_matrix)
+
+rf_pred_probs <- predict(rf_model, test_data, type = "prob")
+rf_roc_curve <- multiclass.roc(test_data$Diagnosis, rf_pred_probs)
+rf_auc_values <- auc(rf_roc_curve)
+
+print(rf_auc_values)
+
+varImpPlot(rf_model, main = "Variable Importance - Weighted Random Forest")
+
+conf_matrix_table <- as.table(rf_conf_matrix$table)
+
+calculate_mcc <- function(confusion_matrix) {
+  n <- sum(confusion_matrix)
+  sum_row <- rowSums(confusion_matrix)
+  sum_col <- colSums(confusion_matrix)
+  
+  numerator <- 0
+  for (i in 1:nrow(confusion_matrix)) {
+    for (j in 1:nrow(confusion_matrix)) {
+      for (k in 1:nrow(confusion_matrix)) {
+        numerator <- numerator + 
+          (confusion_matrix[i, i] * confusion_matrix[j, k] - 
+           confusion_matrix[i, j] * confusion_matrix[k, i])
+      }
+    }
+  }
+  
+  denominator <- sqrt(
+    (n^2 - sum(sum_row^2)) * 
+    (n^2 - sum(sum_col^2))
+  )
+  
+  if (denominator == 0) return(0)
+  return(numerator / denominator)
+}
+
+mcc <- calculate_mcc(conf_matrix_table)
+print(paste("MCC:", mcc))
+
+# Extract confusion matrix table
+cm_table <- rf_conf_matrix$table
+
+# True Positive (TP), False Positive (FP), False Negative (FN)
+tp <- cm_table[positive_class, positive_class]
+fp <- sum(cm_table[, positive_class]) - tp
+fn <- sum(cm_table[positive_class, ]) - tp
+
+# Precision and Recall
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+
+# F1 Score
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall:", round(recall, 3), "\n")
+cat("F1 Score:", round(f1_score, 3), "\n")
+```
+
+## 4.1 ROC curve and confusion matrices
+
+```{r}
+#------------------------------------------------------------------------
+# 4.1 ROC curve and confusion matrices
+#------------------------------------------------------------------------
+protein_columns <- setdiff(colnames(PrimaryModelOne)[which(colnames(PrimaryModelOne) == "X4E.BP1"):which(colnames(PrimaryModelOne) == "VEGFA")], c("CCL23", "CXCL5"))
+
+rf_data <- PrimaryModelOne[, c("Diagnosis", "Race", "Ethnicity", "Sex", protein_columns)]
+rf_data$Diagnosis <- factor(rf_data$Diagnosis, levels = c("PANDAS", "HC"))
+rf_data <- rf_data[complete.cases(rf_data), ]
+names(rf_data) <- make.names(names(rf_data))
+
+class_counts <- table(rf_data$Diagnosis)
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+
+rd <- rf_data
+colnames(rd) <- make.names(colnames(rd), unique = TRUE)
+
+cat("========== RANDOM FOREST WITH DEMOGRAPHICS: PANDAS vs HC ==========\n\n")
+cat("Total samples:", nrow(rf_data), "\n")
+print(table(rf_data$Diagnosis))
+cat("\n")
+
+n_predictors <- ncol(rf_data) - 1
+
+cat("--- Cross-Validation Setup ---\n")
+cat("Method: 10-fold CV with 10 repeats\n")
+cat("mtry: sqrt(p) =", round(sqrt(n_predictors)), "\n")
+cat("ntree: 500\n\n")
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "all")
+
+rf_cv <- caret::train(Diagnosis ~ .,
+               data = rd,
+               method = "rf",
+               trControl = ctrl,
+               metric = "ROC",
+               tuneGrid = expand.grid(mtry = round(sqrt(n_predictors))),
+               ntree = 500,
+               classwt = class_weights)
+
+print(rf_cv)
+
+cat("\n--- Final Random Forest ---\n\n")
+
+rf_model <- randomForest(Diagnosis ~ ., 
+                         data = rf_data, 
+                         ntree = 500, 
+                         mtry = round(sqrt(n_predictors)), 
+                         importance = TRUE, 
+                         classwt = class_weights)
+
+print(rf_model)
+
+cat("\n--- OOB Error Curve ---\n\n")
+plot(rf_model, main = "OOB Error Rate by Number of Trees (with Demographics)")
+legend("topright", colnames(rf_model$err.rate), col = 1:3, lty = 1:3)
+
+varImpPlot(rf_model, main = "Variable Importance - Random Forest with Demographics")
+
+cat("\n--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+oof <- rf_cv$pred
+
+roc_cv <- roc(response = oof$obs, predictor = oof$PANDAS, levels = c("HC", "PANDAS"))
+roc_fig_rf_cov <- roc_cv
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC (with Demographics)")
+auc_cv <- auc(roc_cv)
+auc_sd <- sd(rf_cv$resample$ROC)
+
+cat("Out-of-fold AUC:", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), ")\n\n")
+
+optimal_coords <- coords(roc_cv, "best", best.method = "youden")
+optimal_threshold <- optimal_coords$threshold
+optimal_sens <- optimal_coords$sensitivity
+optimal_spec <- optimal_coords$specificity
+
+cat("--- Optimal Threshold (Youden's Index) ---\n")
+cat("Threshold:", round(optimal_threshold, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n\n")
+
+pred_05_cv <- ifelse(oof$PANDAS >= 0.5, "PANDAS", "HC")
+pred_opt_cv <- ifelse(oof$PANDAS >= optimal_threshold, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_opt_cv <- factor(pred_opt_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(oof$obs, levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_opt_cv <- table(Predicted = pred_opt_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_opt_cv <- sum(diag(cm_opt_cv)) / sum(cm_opt_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Default threshold\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(optimal_threshold, 3), ") ---\n")
+cat("Optimal threshold via Youden's index (maximizes sensitivity + specificity)\n")
+print(cm_opt_cv)
+cat("Accuracy:", round(acc_opt_cv, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The weighted random forest with demographics achieved an AUC of", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), 
+    ") in 10-fold cross-validation (10 repeats).\n")
+cat("At the optimal threshold of", round(optimal_threshold, 3), "(Youden's index), the model achieved", 
+    round(optimal_sens * 100, 1), "% sensitivity and", round(optimal_spec * 100, 1), "% specificity.\n")
+cat("At a 0.85 threshold for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+```
+
+# 5. SVM -- No Covariates
+
+```{r}
+#------------------------------------------------------------------------
+# 5. SVM -- No Covariates
+#------------------------------------------------------------------------
+set.seed(2025)
+conflicts_prefer(base::setdiff)
+protein_columns <- setdiff(colnames(PrimaryModelOne)[which(colnames(PrimaryModelOne) == "X4E.BP1"):which(colnames(PrimaryModelOne) == "VEGFA")], c("CCL23", "CXCL5"))
+
+
+svm_data <- PrimaryModelOne[, c("Diagnosis", protein_columns)]
+svm_data$Diagnosis <- factor(svm_data$Diagnosis, levels = c("PANDAS", "HC"))
+
+sd <- svm_data
+colnames(sd) <- make.names(colnames(sd), unique = TRUE)
+
+cat("========== SVM (RADIAL): PANDAS vs HC ==========\n\n")
+cat("Total samples:", nrow(svm_data), "\n")
+print(table(svm_data$Diagnosis))
+cat("\n")
+
+cat("--- Cross-Validation Setup ---\n")
+cat("Method: 10-fold CV with 10 repeats\n")
+cat("Kernel: Radial basis function\n")
+cat("Preprocessing: Centered and scaled\n\n")
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "all")
+
+svm_cv <- caret::train(Diagnosis ~ .,
+                data = sd,
+                method = "svmRadial",
+                trControl = ctrl,
+                metric = "ROC",
+                preProcess = c("center", "scale"))
+
+print(svm_cv)
+
+cat("\n--- Final SVM Model ---\n\n")
+
+svm_model <- svm(Diagnosis ~ ., 
+                 data = sd,
+                 kernel = "radial",
+                 probability = TRUE,
+                 scale = TRUE)
+
+print(svm_model)
+
+cat("\n--- Training Set Performance (Final Model) ---\n\n")
+
+train_predictions <- predict(svm_model, sd, probability = TRUE)
+train_conf_matrix <- confusionMatrix(train_predictions, sd$Diagnosis, positive = "PANDAS")
+
+print(train_conf_matrix)
+
+cat("\n--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+oof <- svm_cv$pred
+oof_best <- oof[oof$C == svm_cv$bestTune$C & oof$sigma == svm_cv$bestTune$sigma, ]
+
+roc_cv <- roc(response = oof_best$obs, predictor = oof_best$PANDAS, levels = c("HC", "PANDAS"))
+roc_fig_svm <- roc_cv
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC (SVM Radial)")
+auc_cv <- auc(roc_cv)
+auc_sd <- sd(svm_cv$resample$ROC)
+
+cat("Out-of-fold AUC:", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), ")\n\n")
+
+optimal_coords <- coords(roc_cv, "best", best.method = "youden")
+optimal_threshold <- optimal_coords$threshold
+optimal_sens <- optimal_coords$sensitivity
+optimal_spec <- optimal_coords$specificity
+
+cat("--- Optimal Threshold (Youden's Index) ---\n")
+cat("Threshold:", round(optimal_threshold, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n\n")
+
+pred_05_cv <- ifelse(oof_best$PANDAS >= 0.5, "PANDAS", "HC")
+pred_opt_cv <- ifelse(oof_best$PANDAS >= optimal_threshold, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof_best$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_opt_cv <- factor(pred_opt_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(oof_best$obs, levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_opt_cv <- table(Predicted = pred_opt_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_opt_cv <- sum(diag(cm_opt_cv)) / sum(cm_opt_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Default threshold\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(optimal_threshold, 3), ") ---\n")
+cat("Optimal threshold via Youden's index (maximizes sensitivity + specificity)\n")
+print(cm_opt_cv)
+cat("Accuracy:", round(acc_opt_cv, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n--- Variable Importance (Permutation-based) ---\n\n")
+
+library(iml)
+conflicts_prefer(base::setdiff)
+
+predictor <- Predictor$new(svm_model, data = sd[, -1], y = sd$Diagnosis)
+feat_imp <- FeatureImp$new(predictor, loss = "ce")
+plot(feat_imp)
+
+detach("package:iml", unload = TRUE)
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The SVM (radial kernel) achieved an AUC of", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), 
+    ") in 10-fold cross-validation (10 repeats).\n")
+cat("Best tuning parameters: C =", svm_cv$bestTune$C, ", sigma =", round(svm_cv$bestTune$sigma, 4), "\n")
+cat("At the optimal threshold of", round(optimal_threshold, 3), "(Youden's index), the model achieved", 
+    round(optimal_sens * 100, 1), "% sensitivity and", round(optimal_spec * 100, 1), "% specificity.\n")
+cat("At a 0.85 threshold for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+```
+
+# 6. SVM -- With Covariates
+
+```{r}
+#------------------------------------------------------------------------
+# 6. SVM -- With Covariates
+#------------------------------------------------------------------------
+protein_columns <- setdiff(colnames(PrimaryModelOne)[which(colnames(PrimaryModelOne) == "X4E.BP1"):which(colnames(PrimaryModelOne) == "VEGFA")], c("CCL23", "CXCL5"))
+
+svm_data <- PrimaryModelOne[, c("Diagnosis", "Race", "Ethnicity", "Sex", protein_columns)]
+svm_data$Diagnosis <- factor(svm_data$Diagnosis, levels = c("PANDAS", "HC"))
+svm_data <- svm_data[complete.cases(svm_data), ]
+
+svm_df <- svm_data
+colnames(svm_df) <- make.names(colnames(svm_df), unique = TRUE)
+
+cat("========== SVM (RADIAL) WITH DEMOGRAPHICS: PANDAS vs HC ==========\n\n")
+cat("Total samples:", nrow(svm_data), "\n")
+print(table(svm_data$Diagnosis))
+cat("\n")
+
+cat("--- Cross-Validation Setup ---\n")
+cat("Method: 10-fold CV with 10 repeats\n")
+cat("Kernel: Radial basis function\n")
+cat("Preprocessing: Centered and scaled\n\n")
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "all")
+
+svm_cv <- caret::train(Diagnosis ~ .,
+                       data = svm_df,
+                       method = "svmRadial",
+                       trControl = ctrl,
+                       metric = "ROC",
+                       preProcess = c("center", "scale"))
+
+print(svm_cv)
+
+cat("\n--- Final SVM Model ---\n\n")
+
+svm_model <- svm(Diagnosis ~ ., 
+                 data = sd,
+                 kernel = "radial",
+                 probability = TRUE,
+                 scale = TRUE)
+
+print(svm_model)
+
+cat("\n--- Training Set Performance (Final Model) ---\n\n")
+
+train_predictions <- predict(svm_model, sd, probability = TRUE)
+train_conf_matrix <- confusionMatrix(train_predictions, sd$Diagnosis, positive = "PANDAS")
+print(train_conf_matrix)
+
+cat("\n--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+oof <- svm_cv$pred
+oof_best <- oof[oof$C == svm_cv$bestTune$C & oof$sigma == svm_cv$bestTune$sigma, ]
+
+roc_cv <- roc(response = oof_best$obs, predictor = oof_best$PANDAS, levels = c("HC", "PANDAS"))
+roc_fig_svm_cov <- roc_cv
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC (SVM Radial with Demographics)")
+auc_cv <- auc(roc_cv)
+auc_sd <- sd(svm_cv$resample$ROC)
+
+cat("Out-of-fold AUC:", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), ")\n\n")
+
+optimal_coords <- coords(roc_cv, "best", best.method = "youden")
+optimal_threshold <- optimal_coords$threshold
+optimal_sens <- optimal_coords$sensitivity
+optimal_spec <- optimal_coords$specificity
+
+cat("--- Optimal Threshold (Youden's Index) ---\n")
+cat("Threshold:", round(optimal_threshold, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n\n")
+
+pred_05_cv <- ifelse(oof_best$PANDAS >= 0.5, "PANDAS", "HC")
+pred_opt_cv <- ifelse(oof_best$PANDAS >= optimal_threshold, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof_best$PANDAS >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_opt_cv <- factor(pred_opt_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(oof_best$obs, levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_opt_cv <- table(Predicted = pred_opt_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_opt_cv <- sum(diag(cm_opt_cv)) / sum(cm_opt_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Default threshold\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(optimal_threshold, 3), ") ---\n")
+cat("Optimal threshold via Youden's index (maximizes sensitivity + specificity)\n")
+print(cm_opt_cv)
+cat("Accuracy:", round(acc_opt_cv, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n--- Variable Importance (Permutation-based) ---\n\n")
+
+library(iml)
+
+predictor <- Predictor$new(svm_model, data = sd[, -1], y = sd$Diagnosis)
+feat_imp <- FeatureImp$new(predictor, loss = "ce")
+plot(feat_imp)
+
+detach("package:iml", unload = TRUE)
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The SVM (radial kernel) with demographics achieved an AUC of", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), 
+    ") in 10-fold cross-validation (10 repeats).\n")
+cat("Best tuning parameters: C =", svm_cv$bestTune$C, ", sigma =", round(svm_cv$bestTune$sigma, 4), "\n")
+cat("At the optimal threshold of", round(optimal_threshold, 3), "(Youden's index), the model achieved", 
+    round(optimal_sens * 100, 1), "% sensitivity and", round(optimal_spec * 100, 1), "% specificity.\n")
+cat("At a 0.85 threshold for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+```
+
+# 7. Gradient Boosting -- No Covariates
+
+```{r}
+#------------------------------------------------------------------------
+# 7. Gradient Boosting -- No Covariates
+#------------------------------------------------------------------------
+set.seed(2025)
+
+protein_columns <- setdiff(colnames(PrimaryModelOne)[4:81], c("CCL23", "CXCL5"))
+
+xgb_data <- PrimaryModelOne[, c("Diagnosis", protein_columns)]
+xgb_data$Diagnosis <- factor(xgb_data$Diagnosis, levels = c("PANDAS", "HC"))
+
+colnames(xgb_data) <- make.names(colnames(xgb_data), unique = TRUE)
+
+cat("========== XGBOOST: PANDAS vs HC ==========\n\n")
+cat("Total samples:", nrow(xgb_data), "\n")
+print(table(xgb_data$Diagnosis))
+cat("\n")
+
+n_pandas <- sum(xgb_data$Diagnosis == "PANDAS")
+n_hc <- sum(xgb_data$Diagnosis == "HC")
+scale_pos_weight <- n_hc / n_pandas
+
+cat("--- Cross-Validation Setup ---\n")
+cat("Method: 10-fold CV with 10 repeats\n")
+cat("Parameters (conservative for small sample):\n")
+cat("  eta = 0.1, max_depth = 3, subsample = 0.8, colsample_bytree = 0.8\n")
+cat("  scale_pos_weight =", round(scale_pos_weight, 3), "\n\n")
+
+X <- as.matrix(xgb_data[, -1])
+y <- as.numeric(xgb_data$Diagnosis == "PANDAS")
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 3,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  gamma = 0,
+  scale_pos_weight = scale_pos_weight
+)
+
+oof_preds <- rep(NA, nrow(xgb_data))
+auc_values <- c()
+
+for (rep in 1:10) {
+  folds <- sample(rep(1:10, length.out = nrow(xgb_data)))
+  
+  for (fold in 1:10) {
+    train_idx <- which(folds != fold)
+    test_idx <- which(folds == fold)
+    
+    dtrain <- xgb.DMatrix(data = X[train_idx, ], label = y[train_idx])
+    dtest <- xgb.DMatrix(data = X[test_idx, ], label = y[test_idx])
+    
+    model <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 100,
+      verbose = 0
+    )
+    
+    oof_preds[test_idx] <- predict(model, dtest)
+  }
+  
+  auc_values <- c(auc_values, as.numeric(roc(y, oof_preds, levels = c(0, 1), direction = "<")$auc))
+}
+
+cat("--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+roc_cv <- roc(y, oof_preds, levels = c(0, 1), direction = "<")
+roc_fig_gbm <- roc_cv
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC (XGBoost)")
+auc_cv <- auc(roc_cv)
+auc_sd <- sd(auc_values)
+
+cat("Out-of-fold AUC:", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), ")\n\n")
+
+optimal_coords <- coords(roc_cv, "best", best.method = "youden")
+optimal_threshold <- optimal_coords$threshold
+optimal_sens <- optimal_coords$sensitivity
+optimal_spec <- optimal_coords$specificity
+
+cat("--- Optimal Threshold (Youden's Index) ---\n")
+cat("Threshold:", round(optimal_threshold, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n\n")
+
+pred_05_cv <- ifelse(oof_preds >= 0.5, "PANDAS", "HC")
+pred_opt_cv <- ifelse(oof_preds >= optimal_threshold, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof_preds >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_opt_cv <- factor(pred_opt_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(ifelse(y == 1, "PANDAS", "HC"), levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_opt_cv <- table(Predicted = pred_opt_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_opt_cv <- sum(diag(cm_opt_cv)) / sum(cm_opt_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Default threshold\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(optimal_threshold, 3), ") ---\n")
+cat("Optimal threshold via Youden's index (maximizes sensitivity + specificity)\n")
+print(cm_opt_cv)
+cat("Accuracy:", round(acc_opt_cv, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n--- Final XGBoost Model ---\n\n")
+
+dtrain_full <- xgb.DMatrix(data = X, label = y)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain_full,
+  nrounds = 100,
+  verbose = 0
+)
+
+cat("\n--- Training Set Performance (Final Model) ---\n\n")
+
+train_pred_probs <- predict(xgb_model, dtrain_full)
+train_pred_class <- factor(ifelse(train_pred_probs >= 0.5, "PANDAS", "HC"), levels = c("PANDAS", "HC"))
+train_conf_matrix <- confusionMatrix(train_pred_class, xgb_data$Diagnosis, positive = "PANDAS")
+print(train_conf_matrix)
+
+cat("\n--- Feature Importance ---\n\n")
+
+importance_matrix <- xgb.importance(feature_names = colnames(X), model = xgb_model)
+xgb.plot.importance(importance_matrix, main = "Feature Importance - XGBoost")
+
+importance_df <- importance_matrix %>%
+  arrange(desc(Gain)) %>%
+  mutate(Index = row_number())
+
+ggplot(importance_df, aes(x = Index, y = Gain)) +
+  geom_point() +
+  geom_line() +
+  ggtitle("Elbow Plot of Feature Importance (Gain)") +
+  xlab("Feature Index") +
+  ylab("Gain")
+
+cat("\n--- Inflection Point Analysis ---\n\n")
+
+inflection::findipiterplot(importance_df$Index, importance_df$Gain, 2)
+
+elbow <- inflection::findiplist(importance_df$Index, importance_df$Gain, 0)
+inflection_index <- elbow["ESE", "j1"]
+
+important_features <- importance_df$Feature[1:inflection_index]
+important_features_xgb <- important_features
+cat("Proteins before inflection point (based on ESE):\n")
+print(important_features)
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The XGBoost model achieved an AUC of", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), 
+    ") in 10-fold cross-validation (10 repeats).\n")
+cat("Parameters: eta = 0.1, max_depth = 3, subsample = 0.8, colsample_bytree = 0.8, nrounds = 100\n")
+cat("At the optimal threshold of", round(optimal_threshold, 3), "(Youden's index), the model achieved", 
+    round(optimal_sens * 100, 1), "% sensitivity and", round(optimal_spec * 100, 1), "% specificity.\n")
+cat("At a 0.85 threshold for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+cat("Top", inflection_index, "features identified by inflection analysis:", paste(important_features, collapse = ", "), "\n")
+```
+
+# 8. Gradient Boosting -- With Covariates
+
+```{r}
+#------------------------------------------------------------------------
+# 8. Gradient Boosting -- With Covariates
+#------------------------------------------------------------------------
+set.seed(2025)
+
+protein_columns <- setdiff(colnames(PrimaryModelOne)[which(colnames(PrimaryModelOne) == "X4E.BP1"):which(colnames(PrimaryModelOne) == "VEGFA")], c("CCL23", "CXCL5"))
+
+xgb_data <- PrimaryModelOne[, c("Diagnosis", "Race", "Ethnicity", "Sex", protein_columns)]
+xgb_data$Diagnosis <- factor(xgb_data$Diagnosis, levels = c("PANDAS", "HC"))
+xgb_data <- xgb_data[complete.cases(xgb_data), ]
+
+colnames(xgb_data) <- make.names(colnames(xgb_data), unique = TRUE)
+
+xgb_data$Race <- as.numeric(as.factor(xgb_data$Race))
+xgb_data$Ethnicity <- as.numeric(as.factor(xgb_data$Ethnicity))
+xgb_data$Sex <- as.numeric(as.factor(xgb_data$Sex))
+
+cat("========== XGBOOST WITH DEMOGRAPHICS: PANDAS vs HC ==========\n\n")
+cat("Total samples:", nrow(xgb_data), "\n")
+print(table(xgb_data$Diagnosis))
+cat("\n")
+
+n_pandas <- sum(xgb_data$Diagnosis == "PANDAS")
+n_hc <- sum(xgb_data$Diagnosis == "HC")
+scale_pos_weight <- n_hc / n_pandas
+
+cat("--- Cross-Validation Setup ---\n")
+cat("Method: 10-fold CV with 10 repeats\n")
+cat("Parameters (conservative for small sample):\n")
+cat("  eta = 0.1, max_depth = 3, subsample = 0.8, colsample_bytree = 0.8\n")
+cat("  scale_pos_weight =", round(scale_pos_weight, 3), "\n\n")
+
+X <- as.matrix(xgb_data[, -1])
+y <- as.numeric(xgb_data$Diagnosis == "PANDAS")
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 3,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  gamma = 0,
+  scale_pos_weight = scale_pos_weight
+)
+
+oof_preds <- rep(NA, nrow(xgb_data))
+auc_values <- c()
+
+for (rep in 1:10) {
+  folds <- sample(rep(1:10, length.out = nrow(xgb_data)))
+  
+  for (fold in 1:10) {
+    train_idx <- which(folds != fold)
+    test_idx <- which(folds == fold)
+    
+    dtrain <- xgb.DMatrix(data = X[train_idx, ], label = y[train_idx])
+    dtest <- xgb.DMatrix(data = X[test_idx, ], label = y[test_idx])
+    
+    model <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 100,
+      verbose = 0
+    )
+    
+    oof_preds[test_idx] <- predict(model, dtest)
+  }
+  
+  auc_values <- c(auc_values, as.numeric(roc(y, oof_preds, levels = c(0, 1), direction = "<")$auc))
+}
+
+cat("--- Cross-Validated Performance (Out-of-Fold) ---\n\n")
+
+roc_cv <- roc(y, oof_preds, levels = c(0, 1), direction = "<")
+roc_fig_gbm_cov <- roc_cv
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC (XGBoost with Demographics)")
+auc_cv <- auc(roc_cv)
+auc_sd <- sd(auc_values)
+
+cat("Out-of-fold AUC:", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), ")\n\n")
+
+optimal_coords <- coords(roc_cv, "best", best.method = "youden")
+optimal_threshold <- optimal_coords$threshold
+optimal_sens <- optimal_coords$sensitivity
+optimal_spec <- optimal_coords$specificity
+
+cat("--- Optimal Threshold (Youden's Index) ---\n")
+cat("Threshold:", round(optimal_threshold, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n\n")
+
+pred_05_cv <- ifelse(oof_preds >= 0.5, "PANDAS", "HC")
+pred_opt_cv <- ifelse(oof_preds >= optimal_threshold, "PANDAS", "HC")
+pred_085_cv <- ifelse(oof_preds >= 0.85, "PANDAS", "HC")
+
+pred_05_cv <- factor(pred_05_cv, levels = c("PANDAS", "HC"))
+pred_opt_cv <- factor(pred_opt_cv, levels = c("PANDAS", "HC"))
+pred_085_cv <- factor(pred_085_cv, levels = c("PANDAS", "HC"))
+actual <- factor(ifelse(y == 1, "PANDAS", "HC"), levels = c("PANDAS", "HC"))
+
+cm_05_cv <- table(Predicted = pred_05_cv, Actual = actual)
+cm_opt_cv <- table(Predicted = pred_opt_cv, Actual = actual)
+cm_085_cv <- table(Predicted = pred_085_cv, Actual = actual)
+
+acc_05_cv <- sum(diag(cm_05_cv)) / sum(cm_05_cv)
+acc_opt_cv <- sum(diag(cm_opt_cv)) / sum(cm_opt_cv)
+acc_085_cv <- sum(diag(cm_085_cv)) / sum(cm_085_cv)
+
+sens_05 <- cm_05_cv["PANDAS", "PANDAS"] / sum(cm_05_cv[, "PANDAS"])
+spec_05 <- cm_05_cv["HC", "HC"] / sum(cm_05_cv[, "HC"])
+sens_085 <- cm_085_cv["PANDAS", "PANDAS"] / sum(cm_085_cv[, "PANDAS"])
+spec_085 <- cm_085_cv["HC", "HC"] / sum(cm_085_cv[, "HC"])
+
+cat("--- Confusion Matrix (threshold = 0.5) ---\n")
+cat("Default threshold\n")
+print(cm_05_cv)
+cat("Accuracy:", round(acc_05_cv, 3), "\n")
+cat("Sensitivity:", round(sens_05, 3), "| Specificity:", round(spec_05, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold =", round(optimal_threshold, 3), ") ---\n")
+cat("Optimal threshold via Youden's index (maximizes sensitivity + specificity)\n")
+print(cm_opt_cv)
+cat("Accuracy:", round(acc_opt_cv, 3), "\n")
+cat("Sensitivity:", round(optimal_sens, 3), "| Specificity:", round(optimal_spec, 3), "\n")
+
+cat("\n--- Confusion Matrix (threshold = 0.85) ---\n")
+cat("Conservative threshold requiring strong evidence for PANDAS classification\n")
+print(cm_085_cv)
+cat("Accuracy:", round(acc_085_cv, 3), "\n")
+cat("Sensitivity:", round(sens_085, 3), "| Specificity:", round(spec_085, 3), "\n")
+
+cat("\n--- Final XGBoost Model ---\n\n")
+
+dtrain_full <- xgb.DMatrix(data = X, label = y)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain_full,
+  nrounds = 100,
+  verbose = 0
+)
+
+cat("\n--- Training Set Performance (Final Model) ---\n\n")
+
+train_pred_probs <- predict(xgb_model, dtrain_full)
+train_pred_class <- factor(ifelse(train_pred_probs >= 0.5, "PANDAS", "HC"), levels = c("PANDAS", "HC"))
+train_conf_matrix <- confusionMatrix(train_pred_class, xgb_data$Diagnosis, positive = "PANDAS")
+print(train_conf_matrix)
+
+cat("\n--- Feature Importance ---\n\n")
+
+importance_matrix <- xgb.importance(feature_names = colnames(X), model = xgb_model)
+xgb.plot.importance(importance_matrix, main = "Feature Importance - XGBoost with Demographics")
+
+importance_df <- importance_matrix %>%
+  arrange(desc(Gain)) %>%
+  mutate(Index = row_number())
+
+ggplot(importance_df, aes(x = Index, y = Gain)) +
+  geom_point() +
+  geom_line() +
+  ggtitle("Elbow Plot of Feature Importance (Gain) - with Demographics") +
+  xlab("Feature Index") +
+  ylab("Gain")
+
+cat("\n--- Inflection Point Analysis ---\n\n")
+
+inflection::findipiterplot(importance_df$Index, importance_df$Gain, 2)
+
+elbow <- inflection::findiplist(importance_df$Index, importance_df$Gain, 0)
+inflection_index <- elbow["ESE", "j1"]
+
+important_features <- importance_df$Feature[1:inflection_index]
+
+cat("Features before inflection point (based on ESE):\n")
+print(important_features)
+
+cat("\n========== SUMMARY ==========\n\n")
+cat("The XGBoost model with demographics achieved an AUC of", round(as.numeric(auc_cv), 3), "(SD:", round(auc_sd, 3), 
+    ") in 10-fold cross-validation (10 repeats).\n")
+cat("Parameters: eta = 0.1, max_depth = 3, subsample = 0.8, colsample_bytree = 0.8, nrounds = 100\n")
+cat("At the optimal threshold of", round(optimal_threshold, 3), "(Youden's index), the model achieved", 
+    round(optimal_sens * 100, 1), "% sensitivity and", round(optimal_spec * 100, 1), "% specificity.\n")
+cat("At a 0.85 threshold for confirmation, the model achieved", round(sens_085 * 100, 1),
+    "% sensitivity and", round(spec_085 * 100, 1), "% specificity.\n")
+cat("Top", inflection_index, "features identified by inflection analysis:", paste(important_features, collapse = ", "), "\n")
+```
+
+```{r}
+plot(roc_cv, main = "Repeated CV ROC: PANDAS vs HC (XGBoost with Demographics)")
+```
